@@ -37,11 +37,11 @@ FileType = Literal["csv", "excel", "mixed"]
 # =============================================================================
 
 # Parent folder containing county subfolders
-INPUT_ROOT = r"E:\dev\projects\2025\07\15\Texas Real Estate\all_data_counties_category_1_added_test\all_parcels_including_no_acreage\step_0_full_raw_data"
+INPUT_ROOT = r"E:\dev\projects\2025\07\15\Texas Real Estate\all_acres_data_counties\_by_priority\priority_1\step_0_full_raw_data"
 
 # Output root folder:
 # - If you set this to None, it will default to "<input_root>_merged"
-OUTPUT_ROOT = r"E:\dev\projects\2025\07\15\Texas Real Estate\all_data_counties_category_1_added_test\all_parcels_including_no_acreage\step_1_full_raw_data_combined"  # e.g. r"/path/to/output_folder"  or None
+OUTPUT_ROOT = r"E:\dev\projects\2025\07\15\Texas Real Estate\all_acres_data_counties\_by_priority\priority_1\step_1_full_raw_data_combined"  # e.g. r"/path/to/output_folder"  or None
 
 # Set to True for minimal output (same as --quiet)
 QUIET = False

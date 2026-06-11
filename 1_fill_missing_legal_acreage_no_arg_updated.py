@@ -27,6 +27,7 @@ import json
 import math
 import re
 import traceback
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
@@ -41,10 +42,10 @@ import pandas as pd
 
 # This should be the OUTPUT_ROOT from 0_data_merging_no_arg.py.
 # In your current pipeline, 0_data_merging_no_arg.py saves merged county files here.
-INPUT_ROOT = r"E:\dev\projects\2025\07\15\Texas Real Estate\all_data_counties_category_1_added_test\all_parcels_including_no_acreage\step_1_full_raw_data_combined"
+INPUT_ROOT = r"E:\dev\projects\2025\07\15\Texas Real Estate\all_acres_data_counties\_by_priority\priority_1\step_1_full_raw_data_combined"
 
 # New pipeline output folder. Set to None to create "<INPUT_ROOT>_legal_acreage_filled".
-OUTPUT_ROOT = r"E:\dev\projects\2025\07\15\Texas Real Estate\all_data_counties_category_1_added_test\all_parcels_including_no_acreage\step_2_legal_acreage_filled"
+OUTPUT_ROOT = r"E:\dev\projects\2025\07\15\Texas Real Estate\all_acres_data_counties\_by_priority\priority_1\step_2_legal_acreage_filled"
 
 # Only blank/missing legal acreage cells are filled by default.
 OVERWRITE_EXISTING_LEGAL_ACREAGE = False
@@ -59,7 +60,7 @@ SURFACE_UNIT = "square_feet"
 ROUND_ACRES_DECIMALS = 6
 
 # Legal-description fills can be made stricter by changing this to {"high", "medium"}.
-ALLOWED_LEGAL_DESC_CONFIDENCES = {"high", "medium", "low"}
+ALLOWED_LEGAL_DESC_CONFIDENCES = {"high", "medium"}
 
 # If True, adds helper/debug columns showing exactly how each missing acreage was filled.
 ADD_TRACE_COLUMNS = True
@@ -98,6 +99,12 @@ LEGAL_DESC_COLUMN_CANDIDATES = [
     "legal_description",
     "legaldesc",
     "legal",
+    "scraped_legal_description",
+    "scraped legal description",
+    "property_legal_description",
+    "property legal description",
+    "legal_description_full",
+    "legal description full",
 ]
 
 EXTRA_LEGAL_DESC_COLUMN_CANDIDATES = [
@@ -107,6 +114,13 @@ EXTRA_LEGAL_DESC_COLUMN_CANDIDATES = [
     "legal description 3",
     "legal_description_2",
     "legal_description_3",
+    "scraped_legal_description",
+    "scraped legal description",
+    "property_legal_description",
+    "property legal description",
+    "legal_description_full",
+    "legal description full",
+    "description",
 ]
 
 SURFACE_AREA_COLUMN_CANDIDATES = [
@@ -227,6 +241,8 @@ def parse_legal_desc_number(raw: str, unit: str = "acre") -> Optional[float]:
     - 093 AC -> 0.093 AC, because some descriptions omit the decimal point
     - 61,63950 AC -> 61.63950 AC, because some descriptions use a comma like a decimal separator
     - 43,560 SQ FT -> 43560 square feet, because square-foot values use comma thousands
+    - 296. ACRES -> 296.0 ACRES, because some CAD descriptions keep a trailing decimal point
+    - ACRES 44 60 -> 44.60 ACRES, because some exports lose the decimal point as a space
     """
     if raw is None:
         return None
@@ -234,11 +250,20 @@ def parse_legal_desc_number(raw: str, unit: str = "acre") -> Optional[float]:
     if not text:
         return None
 
+    text = re.sub(r"\s+", " ", text)
+
+    if unit == "acre" and re.fullmatch(r"\d+\s+\d{1,4}", text):
+        whole, decimal = text.split()
+        text = whole + "." + decimal
+
     if unit == "acre" and re.fullmatch(r"0\d+", text):
         try:
             return float("0." + text[1:])
         except Exception:
             return None
+
+    if unit == "acre" and re.fullmatch(r"\d+\.", text):
+        text = text + "0"
 
     if "," in text and "." not in text:
         parts = text.split(",")
@@ -267,8 +292,10 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 # LEGAL DESCRIPTION PARSING
 # =========================================================
 # Acre number pattern used only inside acre-related patterns.
-# It accepts normal decimals, .50 decimals, and comma-decimal cases such as 61,63950 AC.
-ACRE_NUMBER_PATTERN = r"(?P<num>(?:\d+(?:,\d+)?(?:\.\d+)?|\.\d+))"
+# It accepts normal decimals, .50 decimals, trailing-dot values like 296.,
+# comma-decimal cases such as 61,63950 AC, and OCR/spacing cases such as ACRES 44 60.
+ACRE_NUMBER_PATTERN = r"(?P<num>(?:\d+\s+\d{1,4}|\d+(?:,\d+)?(?:\.\d*)?|\.\d+))"
+UNLABELED_ACRE_NUMBER_PATTERN = r"(?P<num>(?:\d+\.\d*|\.\d+))"
 SQFT_NUMBER_PATTERN = r"(?P<num>(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)"
 
 ACRE_PATTERNS: List[Tuple[str, re.Pattern[str], float]] = [
@@ -281,7 +308,7 @@ ACRE_PATTERNS: List[Tuple[str, re.Pattern[str], float]] = [
         "ac_unit_before_number",
         # Handles descriptions like: LOT 37 AC 15.6440 or LOT 13 AC 0.499.
         # Require a decimal value so we do not accidentally parse "AC 43,560 SQ FT" as acres.
-        re.compile(r"\b(?:AC|ACS?)\.?\s+(?P<num>(?:\d+\.\d+|\.\d+))", re.IGNORECASE),
+        re.compile(r"\b(?:AC|ACS?)\.?\s+(?P<num>(?:\d+\s+\d{1,4}|\d+\.\d*|\.\d+))", re.IGNORECASE),
         98.0,
     ),
     (
@@ -304,6 +331,16 @@ NOISE_CONTEXT_RE = re.compile(
 
 SUBDIVISION_NAME_RE = re.compile(
     r"SUB(?:DIVISION|D)?\s*-?\s*$|ADDITION\s*-?\s*$|ESTATES?\s*-?\s*$",
+    re.IGNORECASE,
+)
+
+SECONDARY_ACRE_CONTEXT_RE = re.compile(
+    r"\b(?:INCL|INCLUDES?|INCLUDING|INC|AKA|ALSO|PLUS|EXCEPT|LESS|PART OF|PT OF)\b",
+    re.IGNORECASE,
+)
+
+TRAILING_NOTE_RE = re.compile(
+    r"^\s*(?:,?\s*(?:-|&|$)|,\s*\d+\s+[A-Z][A-Z0-9 ]*|,\s*(?:UNBRD|HOMESITE|M/H|MH|HUD|TITLE|HIGH SCHOOL|PARK AREA|OLD|MULTIPLE|ABST|IMPR|CABIN|GUEST|SHORT TERM|STREET|BUSINESS|CEMET|CHURCH)\b)",
     re.IGNORECASE,
 )
 
@@ -389,7 +426,7 @@ def add_acre_candidate(
 
     # Do not punish an explicit "ACRES 95.54" just because a later parenthetical says "@ MKT".
     # Noise is strongest when the matched candidate itself is inside parentheses or is a shorter AC/HS/MKT value.
-    if has_immediate_noise_context(text, start, end) and (in_parentheses or method != "acres_keyword_before_number"):
+    if has_immediate_noise_context(text, start, end) and (in_parentheses or method in {"ac_unit_before_number", "decimal_tight_before_ac_unit"}):
         score -= 55
         warnings.append("immediate_noise_hs_mkt_exemption_or_interest")
 
@@ -419,11 +456,19 @@ def add_acre_candidate(
         if SUBDIVISION_NAME_RE.search(before):
             score -= 45
             warnings.append("likely_subdivision_name_acres")
+        immediate_before = text[max(0, start - 28): start]
+        if re.search(r"\b(?:INCL|INCLUDES?|INCLUDING|INC|AKA|ALSO|PLUS|EXCEPT|LESS|PART OF|PT OF)\s*$", immediate_before, re.IGNORECASE):
+            score -= 65
+            warnings.append("secondary_or_included_acreage_context")
 
     if method == "decimal_tight_before_ac_unit":
         if "." not in raw_number and not raw_number.startswith("."):
             score -= 80
             warnings.append("tight_integer_before_ac_suspicious")
+        immediate_before = text[max(0, start - 28): start]
+        if re.search(r"\b(?:INCL|INCLUDES?|INCLUDING|INC|AKA|ALSO|PLUS|EXCEPT|LESS|PART OF|PT OF)\s*$", immediate_before, re.IGNORECASE):
+            score -= 65
+            warnings.append("secondary_or_included_acreage_context")
 
     candidates.append(
         AcreCandidate(
@@ -451,7 +496,11 @@ def extract_candidates_from_legal_desc(text: str, county_hint: str = "") -> List
 
     # Add unlabeled decimals as fallback candidates. These catch patterns like:
     # "AB 224 R HAILEY 13.82 (3.82 AC HS)" where the main acreage is unlabeled.
-    for match in re.finditer(r"(?<![#A-Za-z0-9/.])(?P<num>(?:\d+\.\d+|\.\d+))(?![A-Za-z0-9/.])", text):
+    # The score is boosted when the decimal appears in the county-specific trailing position:
+    #   "DEAN, J&R SUBD LOT 1-PT, 24.42"
+    #   "G E CO BLK XI 2., -HOMESITE-"
+    #   "G E CO 700 MULTIPLE LOTS LOT GE597, GE598 & GE599, 20.5"
+    for match in re.finditer(rf"(?<![#A-Za-z0-9/.]){UNLABELED_ACRE_NUMBER_PATTERN}(?![A-Za-z0-9/.])", text):
         start, end = match.span()
         if any(start >= c.start and end <= c.end for c in candidates):
             continue
@@ -475,6 +524,17 @@ def extract_candidates_from_legal_desc(text: str, county_hint: str = "") -> List
         if re.search(r"^\s*\+", text[end: end + 3]):
             score += 10
             warnings.append("plus_expression_nearby")
+        before = text[max(0, start - 45): start]
+        after = text[end: min(len(text), end + 80)]
+        if TRAILING_NOTE_RE.search(after) or end == len(text):
+            score += 25
+            warnings.append("county_tail_numeric_acres_pattern")
+        if re.search(r"[,\s]$", before) and not re.search(r"\b(?:SUR|SVY|ABST|A\d{3,}|PID|HUD)\s*$", before, re.IGNORECASE):
+            score += 8
+            warnings.append("separated_from_identifier_context")
+        if SECONDARY_ACRE_CONTEXT_RE.search(before):
+            score -= 45
+            warnings.append("secondary_or_included_acreage_context")
         if in_parentheses and has_immediate_noise_context(text, start, end):
             score -= 55
             warnings.append("immediate_noise_hs_mkt_exemption_or_interest")
@@ -581,6 +641,16 @@ def maybe_additive_acre_sum(text: str, candidates: List[AcreCandidate]) -> Optio
         second = strong[idx + 1]
         between = text[first.end: second.start]
         combined_context = get_context(text, first.start, second.end, radius=20)
+        # Do not add candidates across combined legal-description fields. The pipe
+        # separator is inserted by build_combined_desc_for_row and often means the
+        # same legal description appeared in both CAD and scraped fields.
+        if "|" in between:
+            continue
+        # If the later candidate is an explicit county total like ", ACRES 4.365",
+        # do not add earlier component acreage to it. This prevents double counting
+        # descriptions that list a component and then provide the official total.
+        if second.method == "acres_keyword_before_number":
+            continue
         if not re.search(r"(&|\+|\bAND\b)", between, re.IGNORECASE):
             continue
         if NOISE_CONTEXT_RE.search(combined_context):
@@ -612,7 +682,7 @@ def confidence_from_candidates(chosen: List[AcreCandidate], method: str, all_can
     if not chosen:
         return "none"
     if method in {"square_feet_fallback", "dimensions_feet_fallback", "unlabeled_decimal_fallback"}:
-        return "medium" if chosen[0].score >= 45 else "low"
+        return "medium" if chosen[0].score >= 55 else "low"
     if method == "additive_acres_sum":
         return "medium"
     score = max(c.score for c in chosen)
@@ -678,7 +748,7 @@ def parse_legal_description_for_acres(value: Any, county_hint: str = "") -> Pars
     elif method == "dimensions_feet_fallback":
         notes = "No stronger acreage pattern was selected; converted feet dimensions to acres."
     elif method == "unlabeled_decimal_fallback":
-        notes = "Used an unlabeled decimal because no stronger acre keyword candidate was available or reliable."
+        notes = "Used an unlabeled decimal because no stronger acre keyword candidate was available or reliable; county-tail numeric contexts are promoted to medium confidence."
 
     return ParsedAcreResult(
         acres_found=True,
@@ -929,6 +999,8 @@ def fill_missing_legal_acreage_for_dataframe(
     surface_area_fallback_after_missing_desc = 0
     surface_area_fallback_after_no_legal_acres_found = 0
     surface_area_fallback_after_unaccepted_legal_acres = 0
+    legal_desc_method_counter: Counter[str] = Counter()
+    legal_desc_confidence_counter: Counter[str] = Counter()
 
     for idx in out.index[target_mask]:
         row = out.loc[idx]
@@ -946,6 +1018,9 @@ def fill_missing_legal_acreage_for_dataframe(
         if combined_desc:
             legal_desc_parse_attempts += 1
             legal_result = parse_legal_description_for_acres(combined_desc, county_hint=county_hint)
+            if legal_result.acres_found and legal_result.acres_value is not None:
+                legal_desc_method_counter[legal_result.method] += 1
+                legal_desc_confidence_counter[legal_result.confidence] += 1
             if ADD_TRACE_COLUMNS:
                 out.at[idx, "legal_acreage_legal_desc_value"] = legal_result.acres_value
                 out.at[idx, "legal_acreage_legal_desc_confidence"] = legal_result.confidence
@@ -1052,6 +1127,9 @@ def fill_missing_legal_acreage_for_dataframe(
         "surface_area_fallback_after_missing_desc": surface_area_fallback_after_missing_desc,
         "surface_area_fallback_after_no_legal_acres_found": surface_area_fallback_after_no_legal_acres_found,
         "surface_area_fallback_after_unaccepted_legal_acres": surface_area_fallback_after_unaccepted_legal_acres,
+        "legal_desc_detected_pattern_counts": json.dumps(dict(legal_desc_method_counter.most_common()), ensure_ascii=False),
+        "legal_desc_detected_confidence_counts": json.dumps(dict(legal_desc_confidence_counter.most_common()), ensure_ascii=False),
+        "legal_desc_dominant_detected_pattern": legal_desc_method_counter.most_common(1)[0][0] if legal_desc_method_counter else "",
         "generated_at_utc": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
     }
     return out, summary
@@ -1123,6 +1201,9 @@ def process_parent_folder(input_root: Path, output_root: Path, verbose: bool = T
                 print(f"[FILLED] {summary.get('filled_total', 0):,} total | "
                       f"legal_desc={summary.get('filled_from_legal_desc', 0):,} | "
                       f"surface_area_fallback={summary.get('filled_from_surface_area', 0):,}")
+                if summary.get("legal_desc_dominant_detected_pattern"):
+                    print(f"[LEGAL DESC PATTERN] dominant={summary.get('legal_desc_dominant_detected_pattern')} | "
+                          f"counts={summary.get('legal_desc_detected_pattern_counts')}")
                 print(f"[SURFACE FALLBACK REASONS] missing_desc={summary.get('surface_area_fallback_after_missing_desc', 0):,} | "
                       f"no_legal_acres_found={summary.get('surface_area_fallback_after_no_legal_acres_found', 0):,} | "
                       f"unaccepted_legal_acres={summary.get('surface_area_fallback_after_unaccepted_legal_acres', 0):,}")
