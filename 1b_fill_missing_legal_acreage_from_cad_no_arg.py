@@ -17,13 +17,14 @@ What it does
 - Gets the county CAD website link from the same Google Sheet/settings pattern used by
   property_type_enrichment_uc_chrome_no_args.py, or from COUNTY_APPRAISAL_WEBSITES.
 - Builds BIS/eSearch URLs like /Property/View/{id} and /Property/View/R{id}.
-- Opens the property page with undetected Chrome/Selenium.
+- Tries a fast browser-like HTTP request first, then falls back to undetected Chrome/Selenium when needed.
+- Detects temporary BIS/CAD generic error pages and retries them instead of marking them as no land table.
 - Parses the Property Land table and extracts/sums the Acreage column.
 - Writes the acreage back to the same legal_acreage column in a live/resumable output file.
 - Adds trace columns showing URL, status, raw acreage, method, attempts, and timestamp.
 - Runs multiple counties at the same time and uses per-county browser workers.
-- Performs a conservative per-county capacity probe and then adapts delays/cooldowns if
-  the site slows down, blocks, or repeatedly fails.
+- Performs a per-county capacity probe and then adapts delays/cooldowns only for real site/transport failures.
+  Valid no-land/no-acreage pages no longer trigger one-minute cooldowns.
 - Generates CSV and HTML reports at the end.
 
 Install requirements
@@ -52,6 +53,8 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
@@ -91,6 +94,8 @@ except Exception:
 # CONFIG - EDIT THESE VARIABLES, NO CLI ARGUMENTS NEEDED
 # =============================================================================
 
+SCRIPT_VERSION = "cad_legal_acreage_fast_stable_v2"
+
 # This should be the OUTPUT_ROOT from 1_fill_missing_legal_acreage_no_arg_updated.py.
 INPUT_ROOT = r"E:\dev\projects\2025\07\15\Texas Real Estate\all_acres_data_counties\_by_priority\priority_1\step_2_legal_acreage_filled"
 
@@ -106,7 +111,25 @@ COUNTIES_TO_RUN: List[str] = []
 SUPPORTED_INPUT_EXTENSIONS = {".csv", ".xlsx", ".xls"}
 OVERWRITE_OUTPUT = False
 RESUME_INCOMPLETE_OUTPUT = True
-RESCRAPE_FAILED_ROWS = False
+
+# Retry rows that were marked failed/blocked/site_error in a previous run.
+# This is enabled by default for this CAD step because county websites can return
+# temporary error pages even when the same URL works a moment later.
+RESCRAPE_FAILED_ROWS = True
+
+# Old versions of this script could classify temporary CAD error pages as
+# no_land_table. Rows with terminal no-fill statuses from an older parser version
+# are retried once; rows produced by this SCRIPT_VERSION are skipped on resume.
+RETRY_STALE_TERMINAL_NO_FILL_ROWS_ON_RESUME = True
+
+# After this parser has confirmed property_not_found/no_land_table/no_acreage_value,
+# do not re-scrape those rows on later resumes unless you intentionally set this True.
+RESCRAPE_CURRENT_TERMINAL_NO_FILL_ROWS = False
+
+# If a browser worker crashes, retry any rows that never reached the progress
+# callback before writing a final summary. This prevents counties from being
+# marked complete when only part of a worker chunk actually ran.
+RETRY_UNPROCESSED_ROWS_AFTER_WORKER_CRASH = True
 
 # Save the output file after every scraped row. This is safest/resumable, especially for CSV.
 LIVE_SAVE_ENABLED = True
@@ -193,20 +216,39 @@ CHROME_START_STAGGER_SECONDS = float(getattr(base_settings, "CHROME_START_STAGGE
 CLEAR_UNDETECTED_CHROMEDRIVER_CACHE_ON_START = bool(getattr(base_settings, "CLEAR_UNDETECTED_CHROMEDRIVER_CACHE_ON_START", False)) if base_settings else False
 RESTART_BROWSER_EVERY_N_PAGES = int(getattr(base_settings, "RESTART_BROWSER_EVERY_N_PAGES", 250)) if base_settings else 250
 
-# Overall concurrency. Keep this conservative. The capacity probe can lower per-county workers.
-MAX_COUNTY_WORKERS = int(getattr(base_settings, "MAX_COUNTY_WORKERS", 4)) if base_settings else 4
-MAX_BROWSER_WORKERS_PER_COUNTY = int(getattr(base_settings, "MAX_BROWSER_WORKERS_PER_COUNTY", 2)) if base_settings else 2
+# Overall concurrency. Keep this conservative by default, but do not inherit the
+# very slow property-type scraper pacing unless CAD-specific settings are added.
+# Optional overrides can be placed in property_type_enrichment_uc_settings.py as:
+# CAD_ACREAGE_MAX_COUNTY_WORKERS, CAD_ACREAGE_MAX_BROWSER_WORKERS_PER_COUNTY, etc.
+MAX_COUNTY_WORKERS = int(getattr(base_settings, "CAD_ACREAGE_MAX_COUNTY_WORKERS", getattr(base_settings, "MAX_COUNTY_WORKERS", 4))) if base_settings else 4
+MAX_BROWSER_WORKERS_PER_COUNTY = int(getattr(base_settings, "CAD_ACREAGE_MAX_BROWSER_WORKERS_PER_COUNTY", max(2, min(3, getattr(base_settings, "MAX_BROWSER_WORKERS_PER_COUNTY", 2))))) if base_settings else 3
 
-# Respectful pacing / adaptive throttling.
-MIN_DELAY_SECONDS = float(getattr(base_settings, "MIN_DELAY_SECONDS", 2.5)) if base_settings else 2.5
-MAX_DELAY_SECONDS = float(getattr(base_settings, "MAX_DELAY_SECONDS", 6.0)) if base_settings else 6.0
-LONG_PAUSE_EVERY_N_PAGES = int(getattr(base_settings, "LONG_PAUSE_EVERY_N_PAGES", 40)) if base_settings else 40
-LONG_PAUSE_MIN_SECONDS = float(getattr(base_settings, "LONG_PAUSE_MIN_SECONDS", 45)) if base_settings else 45.0
-LONG_PAUSE_MAX_SECONDS = float(getattr(base_settings, "LONG_PAUSE_MAX_SECONDS", 120)) if base_settings else 120.0
-COOLDOWN_AFTER_BLOCK_SECONDS = float(getattr(base_settings, "COOLDOWN_AFTER_BLOCK_SECONDS", 180)) if base_settings else 180.0
-MAX_CONSECUTIVE_FAILURES_PER_BROWSER = int(getattr(base_settings, "MAX_CONSECUTIVE_FAILURES_PER_BROWSER", 8)) if base_settings else 8
-MAX_ATTEMPTS_PER_PROPERTY = 3
-RETRY_DELAY_SECONDS = 5.0
+# Fast path: BIS/eSearch property pages are usually server-rendered HTML. Trying a
+# normal HTTP GET first is much faster than opening every parcel in Chrome. If a
+# site needs the browser, the script falls back to Selenium automatically.
+USE_FAST_HTTP_FIRST = bool(getattr(base_settings, "CAD_ACREAGE_USE_FAST_HTTP_FIRST", True)) if base_settings else True
+FALLBACK_TO_BROWSER_AFTER_HTTP_FAILURE = bool(getattr(base_settings, "CAD_ACREAGE_FALLBACK_TO_BROWSER", True)) if base_settings else True
+FAST_HTTP_TIMEOUT_SECONDS = float(getattr(base_settings, "CAD_ACREAGE_FAST_HTTP_TIMEOUT_SECONDS", 18.0)) if base_settings else 18.0
+FAST_HTTP_RETRIES_PER_URL = int(getattr(base_settings, "CAD_ACREAGE_FAST_HTTP_RETRIES_PER_URL", 1)) if base_settings else 1
+FAST_HTTP_USER_AGENT = getattr(
+    base_settings,
+    "CAD_ACREAGE_FAST_HTTP_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+) if base_settings else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+# Respectful pacing / adaptive throttling. These defaults are faster than the
+# original property-type scraper, because the script only fetches missing acreage
+# and now treats valid no-land/no-acreage pages as data outcomes, not failures.
+MIN_DELAY_SECONDS = float(getattr(base_settings, "CAD_ACREAGE_MIN_DELAY_SECONDS", 0.35)) if base_settings else 0.35
+MAX_DELAY_SECONDS = float(getattr(base_settings, "CAD_ACREAGE_MAX_DELAY_SECONDS", 1.50)) if base_settings else 1.50
+LONG_PAUSE_EVERY_N_PAGES = int(getattr(base_settings, "CAD_ACREAGE_LONG_PAUSE_EVERY_N_PAGES", 150)) if base_settings else 150
+LONG_PAUSE_MIN_SECONDS = float(getattr(base_settings, "CAD_ACREAGE_LONG_PAUSE_MIN_SECONDS", 8.0)) if base_settings else 8.0
+LONG_PAUSE_MAX_SECONDS = float(getattr(base_settings, "CAD_ACREAGE_LONG_PAUSE_MAX_SECONDS", 20.0)) if base_settings else 20.0
+COOLDOWN_AFTER_BLOCK_SECONDS = float(getattr(base_settings, "CAD_ACREAGE_COOLDOWN_AFTER_BLOCK_SECONDS", 90.0)) if base_settings else 90.0
+MAX_CONSECUTIVE_FAILURES_PER_BROWSER = int(getattr(base_settings, "CAD_ACREAGE_MAX_CONSECUTIVE_FAILURES_PER_BROWSER", 8)) if base_settings else 8
+MAX_ATTEMPTS_PER_PROPERTY = int(getattr(base_settings, "CAD_ACREAGE_MAX_ATTEMPTS_PER_PROPERTY", 3)) if base_settings else 3
+RETRY_DELAY_SECONDS = float(getattr(base_settings, "CAD_ACREAGE_RETRY_DELAY_SECONDS", 2.0)) if base_settings else 2.0
 
 # Dynamic capacity probe. The probe opens a small number of real property pages per county.
 ENABLE_CAPACITY_PROBE = True
@@ -218,13 +260,20 @@ CAPACITY_PROBE_MAX_BLOCKED = 0
 CAPACITY_PROBE_MAX_AVG_SECONDS = 35.0
 CAPACITY_PROBE_COOLDOWN_BETWEEN_LEVELS_SECONDS = 8.0
 
-# Adaptive throttling once scraping starts.
-ADAPTIVE_WINDOW_SIZE = 20
-ADAPTIVE_FAILURE_RATE_THRESHOLD = 0.35
-ADAPTIVE_MAX_DELAY_MULTIPLIER = 6.0
-ADAPTIVE_SUCCESS_DECAY = 0.96
-ADAPTIVE_FAILURE_INCREASE = 1.25
-ADAPTIVE_BLOCK_INCREASE = 1.75
+# Adaptive throttling once scraping starts. Only real site/transport failures
+# affect throttling. Data outcomes like no_land_table or no_acreage_value do not.
+ADAPTIVE_WINDOW_SIZE = int(getattr(base_settings, "CAD_ACREAGE_ADAPTIVE_WINDOW_SIZE", 20)) if base_settings else 20
+ADAPTIVE_FAILURE_RATE_THRESHOLD = float(getattr(base_settings, "CAD_ACREAGE_ADAPTIVE_FAILURE_RATE_THRESHOLD", 0.50)) if base_settings else 0.50
+ADAPTIVE_MAX_DELAY_MULTIPLIER = float(getattr(base_settings, "CAD_ACREAGE_ADAPTIVE_MAX_DELAY_MULTIPLIER", 3.0)) if base_settings else 3.0
+ADAPTIVE_SUCCESS_DECAY = float(getattr(base_settings, "CAD_ACREAGE_ADAPTIVE_SUCCESS_DECAY", 0.94)) if base_settings else 0.94
+ADAPTIVE_FAILURE_INCREASE = float(getattr(base_settings, "CAD_ACREAGE_ADAPTIVE_FAILURE_INCREASE", 1.18)) if base_settings else 1.18
+ADAPTIVE_BLOCK_INCREASE = float(getattr(base_settings, "CAD_ACREAGE_ADAPTIVE_BLOCK_INCREASE", 1.60)) if base_settings else 1.60
+ADAPTIVE_SOFT_COOLDOWN_SECONDS = float(getattr(base_settings, "CAD_ACREAGE_ADAPTIVE_SOFT_COOLDOWN_SECONDS", 8.0)) if base_settings else 8.0
+
+REQUEST_OK_STATUSES = {"success", "no_land_table", "no_acreage_value", "property_not_found"}
+TERMINAL_NO_FILL_STATUSES = {"no_land_table", "no_acreage_value", "property_not_found"}
+THROTTLE_BAD_STATUSES = {"blocked", "site_error", "failed"}
+FAST_HTTP_ACCEPT_STATUSES = REQUEST_OK_STATUSES
 
 # Logging / reports.
 LOG_LEVEL = "INFO"
@@ -276,6 +325,7 @@ class CadAcreageResult:
     input_id: str
     status: str
     url: str = ""
+    fetch_mode: str = ""
     acreage: Optional[float] = None
     raw_acreage: str = ""
     method: str = ""
@@ -305,6 +355,8 @@ class FileSummary:
     property_not_found: int = 0
     no_land_table: int = 0
     no_acreage_value: int = 0
+    site_error: int = 0
+    unprocessed: int = 0
     missing_after: int = 0
     worker_count: int = 1
     elapsed_seconds: float = 0.0
@@ -465,6 +517,8 @@ def prepare_dataframe_for_live_updates(df: pd.DataFrame, legal_col: str) -> None
         "cad_legal_acreage_land_rows_json",
         "cad_legal_acreage_scraped_at",
         "cad_legal_acreage_worker",
+        "cad_legal_acreage_fetch_mode",
+        "cad_legal_acreage_parser_version",
     ]
     make_dataframe_columns_mutable(df, trace_cols)
 
@@ -485,6 +539,37 @@ def make_soup(html_text: str) -> BeautifulSoup:
 
 def html_escape(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    try:
+        if seconds is None:
+            return ""
+        seconds_float = float(seconds)
+        if seconds_float < 0 or math.isnan(seconds_float):
+            return ""
+    except Exception:
+        return ""
+    seconds = int(round(seconds_float))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def status_counts_as_request_ok(status: str) -> bool:
+    return clean_text(status).lower() in REQUEST_OK_STATUSES
+
+
+def status_should_throttle(status: str) -> bool:
+    return clean_text(status).lower() in THROTTLE_BAD_STATUSES
+
+
+def status_is_terminal_no_fill(status: str) -> bool:
+    return clean_text(status).lower() in TERMINAL_NO_FILL_STATUSES
 
 
 # =============================================================================
@@ -717,6 +802,8 @@ TRACE_COLUMN_DEFAULTS: Dict[str, Any] = {
     "cad_legal_acreage_land_rows_json": "",
     "cad_legal_acreage_scraped_at": "",
     "cad_legal_acreage_worker": "",
+    "cad_legal_acreage_fetch_mode": "",
+    "cad_legal_acreage_parser_version": "",
 }
 
 
@@ -818,6 +905,35 @@ def page_looks_blocked(html_text: str) -> bool:
         "service unavailable",
     ]
     return any(term in text for term in blocked_terms)
+
+
+def page_looks_transient_site_error(html_text: str) -> bool:
+    """Detect the BIS/CAD generic error page shown in the screenshots.
+
+    These pages are often temporary. They should be retried and should not be
+    misclassified as no_land_table, because that would make the resume logic
+    skip a row that may work in another browser/session.
+    """
+    soup = make_soup(html_text)
+    title = clean_text(soup.title.get_text(" ", strip=True)).lower() if soup.title else ""
+    text = clean_text(soup.get_text(" ", strip=True)).lower()
+    transient_terms = [
+        "an error occurred",
+        "oops! something went wrong",
+        "oops something went wrong",
+        "please try again later",
+        "something went wrong",
+        "internal server error",
+        "runtime error",
+    ]
+    return title == "error" or any(term in text for term in transient_terms)
+
+
+def page_has_property_details(soup: BeautifulSoup) -> bool:
+    if find_panel_by_heading(soup, "Property Details") is not None:
+        return True
+    text = clean_text(soup.get_text(" ", strip=True))
+    return "Property ID:" in text and ("Legal Description:" in text or "Property Values" in text)
 
 
 # =============================================================================
@@ -1007,15 +1123,22 @@ def parse_cad_legal_acreage_from_html(html_text: str) -> Tuple[Optional[float], 
     soup = make_soup(html_text)
     body_text = clean_text(soup.get_text(" ", strip=True))
 
+    if page_looks_transient_site_error(html_text):
+        return None, "", "", [], "site_error", "", "cad_generic_error_page"
     if "Property Not Found" in body_text or "No data found" in body_text:
-        return None, "", "", [], "property_not_found", "", ""
+        return None, "", "", [], "property_not_found", "", "property_not_found"
     if page_looks_blocked(html_text):
         return None, "", "", [], "blocked", "", "blocked_or_rate_limited"
 
+    valid_property_page = page_has_property_details(soup)
     property_id_page, quick_ref_id_page = extract_property_id_page(soup)
     rows, source = find_property_land_rows(soup)
     if not rows:
-        return None, "", "", [], "no_land_table", property_id_page, source
+        if valid_property_page:
+            return None, "", "", [], "no_land_table", property_id_page, f"confirmed_valid_property_page_without_land_table:{source}"
+        title = clean_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
+        body_preview = body_text[:240]
+        return None, "", "", [], "failed", property_id_page, f"property_page_not_recognized_or_land_table_not_found | title={title} | body={body_preview}"
 
     acreage, raw, method = aggregate_land_rows(rows)
     if acreage is None:
@@ -1052,6 +1175,8 @@ def wait_for_property_page(driver: uc.Chrome) -> None:
                 or "Property Land" in d.page_source
                 or "Property Not Found" in d.page_source
                 or "No data found" in d.page_source
+                or "An Error Occurred" in d.page_source
+                or "something went wrong" in d.page_source.lower()
                 or "captcha" in d.page_source.lower()
                 or "access denied" in d.page_source.lower()
             )
@@ -1060,10 +1185,153 @@ def wait_for_property_page(driver: uc.Chrome) -> None:
         pass
 
 
+
+def build_result_from_html_parse(
+    input_id: str,
+    url: str,
+    html_text: str,
+    attempts: int,
+    start_time: float,
+    fetch_mode: str,
+    transport_error: str = "",
+) -> CadAcreageResult:
+    acreage, raw, method, rows, status, property_id_page, quick_ref_or_error = parse_cad_legal_acreage_from_html(html_text)
+    elapsed = time.perf_counter() - start_time
+
+    quick_ref_id_page = quick_ref_or_error if status == "success" else ""
+    error = "" if status == "success" else (quick_ref_or_error or transport_error or status)
+    if transport_error and status in {"failed", "site_error"} and transport_error not in error:
+        error = f"{transport_error} | {error}" if error else transport_error
+
+    return CadAcreageResult(
+        input_id=input_id,
+        status=status,
+        url=url,
+        fetch_mode=fetch_mode,
+        acreage=acreage,
+        raw_acreage=raw,
+        method=method,
+        land_rows=list(rows),
+        attempts=attempts,
+        elapsed_seconds=round(elapsed, 3),
+        error=error,
+        scraped_at=datetime.now().isoformat(timespec="seconds"),
+        property_id_page=property_id_page,
+        quick_ref_id_page=quick_ref_id_page,
+    )
+
+
+def fetch_html_fast(url: str) -> Tuple[str, str]:
+    """Fetch a CAD property page with a normal browser-like HTTP request.
+
+    Returns (html_text, transport_error). HTTP error bodies are still returned
+    when available so the parser can classify BIS generic error pages.
+    """
+    headers = {
+        "User-Agent": FAST_HTTP_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "close",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=FAST_HTTP_TIMEOUT_SECONDS) as response:
+            data = response.read()
+            charset = response.headers.get_content_charset() or "utf-8"
+            return data.decode(charset, errors="replace"), ""
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read()
+            charset = exc.headers.get_content_charset() if exc.headers else "utf-8"
+            html_text = body.decode(charset or "utf-8", errors="replace") if body else ""
+        except Exception:
+            html_text = ""
+        return html_text, f"http_error_{exc.code}"
+    except urllib.error.URLError as exc:
+        return "", f"url_error: {str(exc.reason)[:180]}"
+    except Exception as exc:
+        return "", f"http_fetch_error: {type(exc).__name__}: {str(exc)[:180]}"
+
+
+def load_and_parse_cad_legal_acreage_fast_http(
+    base_url: str,
+    prop_id: str,
+    max_attempts: int = FAST_HTTP_RETRIES_PER_URL,
+) -> CadAcreageResult:
+    input_id = clean_property_id(prop_id)
+    if not input_id:
+        return CadAcreageResult(
+            input_id=input_id,
+            status="failed",
+            fetch_mode="http",
+            error="blank_property_id",
+            scraped_at=datetime.now().isoformat(timespec="seconds"),
+        )
+
+    start_time = time.perf_counter()
+    last_result: Optional[CadAcreageResult] = None
+    attempts = max(1, int(max_attempts))
+
+    for attempt in range(1, attempts + 1):
+        for candidate_id in build_candidate_id_values(input_id):
+            url = build_property_url(base_url, candidate_id, TAX_YEAR)
+            html_text, transport_error = fetch_html_fast(url)
+            if html_text:
+                result = build_result_from_html_parse(
+                    input_id=input_id,
+                    url=url,
+                    html_text=html_text,
+                    attempts=attempt,
+                    start_time=start_time,
+                    fetch_mode="http",
+                    transport_error=transport_error,
+                )
+                last_result = result
+
+                # Try alternate id formats if this candidate was not found.
+                if result.status == "property_not_found":
+                    continue
+
+                # Success and verified data-absence statuses are accepted from HTTP.
+                if result.status in FAST_HTTP_ACCEPT_STATUSES:
+                    return result
+
+                # Otherwise let retry/browser fallback handle it.
+                continue
+
+            elapsed = time.perf_counter() - start_time
+            last_result = CadAcreageResult(
+                input_id=input_id,
+                status="failed",
+                url=url,
+                fetch_mode="http",
+                attempts=attempt,
+                elapsed_seconds=round(elapsed, 3),
+                error=transport_error or "empty_http_response",
+                scraped_at=datetime.now().isoformat(timespec="seconds"),
+            )
+
+        if attempt < attempts:
+            time.sleep(max(0.2, RETRY_DELAY_SECONDS) * attempt)
+
+    if last_result is not None:
+        return last_result
+
+    return CadAcreageResult(
+        input_id=input_id,
+        status="failed",
+        fetch_mode="http",
+        attempts=attempts,
+        elapsed_seconds=round(time.perf_counter() - start_time, 3),
+        error="no_candidate_urls_built",
+        scraped_at=datetime.now().isoformat(timespec="seconds"),
+    )
+
 def load_and_parse_cad_legal_acreage(driver: uc.Chrome, base_url: str, prop_id: str, max_attempts: int = MAX_ATTEMPTS_PER_PROPERTY) -> CadAcreageResult:
     input_id = clean_property_id(prop_id)
     if not input_id:
-        return CadAcreageResult(input_id=input_id, status="failed", error="blank_property_id", scraped_at=datetime.now().isoformat(timespec="seconds"))
+        return CadAcreageResult(input_id=input_id, status="failed", fetch_mode="browser", error="blank_property_id", scraped_at=datetime.now().isoformat(timespec="seconds"))
 
     start_time = time.perf_counter()
     last_error = ""
@@ -1098,6 +1366,7 @@ def load_and_parse_cad_legal_acreage(driver: uc.Chrome, base_url: str, prop_id: 
                         input_id=input_id,
                         status="success",
                         url=url,
+                        fetch_mode="browser",
                         acreage=acreage,
                         raw_acreage=raw,
                         method=method,
@@ -1119,6 +1388,7 @@ def load_and_parse_cad_legal_acreage(driver: uc.Chrome, base_url: str, prop_id: 
                         input_id=input_id,
                         status="blocked",
                         url=url,
+                        fetch_mode="browser",
                         raw_acreage=last_raw,
                         method=last_method,
                         land_rows=last_rows,
@@ -1145,7 +1415,9 @@ def load_and_parse_cad_legal_acreage(driver: uc.Chrome, base_url: str, prop_id: 
 
     elapsed = time.perf_counter() - start_time
     status = "property_not_found" if last_error == "property_not_found" else "failed"
-    if last_error.startswith("property_land_table") or "land_table" in last_error:
+    if "cad_generic_error_page" in last_error or "something went wrong" in last_error.lower() or "try again later" in last_error.lower():
+        status = "site_error"
+    if last_error.startswith("property_land_table") or "land_table" in last_error or "confirmed_valid_property_page_without_land_table" in last_error:
         status = "no_land_table"
     if "no_numeric" in last_error or "zero_acreage" in last_error:
         status = "no_acreage_value"
@@ -1154,6 +1426,7 @@ def load_and_parse_cad_legal_acreage(driver: uc.Chrome, base_url: str, prop_id: 
         input_id=input_id,
         status=status,
         url=last_url,
+        fetch_mode="browser",
         raw_acreage=last_raw,
         method=last_method,
         land_rows=last_rows,
@@ -1186,9 +1459,10 @@ class CountyLoadController:
             time.sleep(delay)
 
     def after_result(self, result: CadAcreageResult, worker_id: int) -> None:
+        status = clean_text(result.status).lower()
         with self.lock:
-            self.recent_statuses.append(result.status)
-            if result.status == "blocked":
+            self.recent_statuses.append(status)
+            if status == "blocked":
                 self.delay_multiplier = min(ADAPTIVE_MAX_DELAY_MULTIPLIER, self.delay_multiplier * ADAPTIVE_BLOCK_INCREASE)
                 self.cooldown_until = max(self.cooldown_until, time.time() + COOLDOWN_AFTER_BLOCK_SECONDS)
                 logging.warning(
@@ -1200,24 +1474,33 @@ class CountyLoadController:
                 )
                 return
 
-            if result.status == "success":
+            if status_counts_as_request_ok(status):
+                # Success and verified no-fill pages mean the server responded normally.
                 self.delay_multiplier = max(1.0, self.delay_multiplier * ADAPTIVE_SUCCESS_DECAY)
-            else:
+            elif status_should_throttle(status):
                 self.delay_multiplier = min(ADAPTIVE_MAX_DELAY_MULTIPLIER, self.delay_multiplier * ADAPTIVE_FAILURE_INCREASE)
 
             if len(self.recent_statuses) >= min(ADAPTIVE_WINDOW_SIZE, 8):
-                bad = sum(1 for s in self.recent_statuses if s not in {"success", "property_not_found", "no_acreage_value"})
+                bad = sum(1 for s in self.recent_statuses if status_should_throttle(s))
                 rate = bad / len(self.recent_statuses)
                 if rate >= ADAPTIVE_FAILURE_RATE_THRESHOLD:
                     self.delay_multiplier = min(ADAPTIVE_MAX_DELAY_MULTIPLIER, self.delay_multiplier * ADAPTIVE_FAILURE_INCREASE)
-                    self.cooldown_until = max(self.cooldown_until, time.time() + min(COOLDOWN_AFTER_BLOCK_SECONDS, 60.0))
+                    self.cooldown_until = max(self.cooldown_until, time.time() + ADAPTIVE_SOFT_COOLDOWN_SECONDS)
                     logging.warning(
-                        "[%s] recent failure rate %.0f%%; slowing county to multiplier %.2f",
+                        "[%s] recent real site/transport failure rate %.0f%%; slowing county to multiplier %.2f for %.0fs",
                         self.county_name,
                         rate * 100,
                         self.delay_multiplier,
+                        ADAPTIVE_SOFT_COOLDOWN_SECONDS,
                     )
 
+    def snapshot(self) -> Dict[str, Any]:
+        with self.lock:
+            return {
+                "delay_multiplier": round(self.delay_multiplier, 3),
+                "cooldown_remaining": max(0.0, round(self.cooldown_until - time.time(), 1)),
+                "recent_statuses": list(self.recent_statuses),
+            }
 
 def browser_worker(
     county_name: str,
@@ -1229,7 +1512,8 @@ def browser_worker(
 ) -> Dict[int, CadAcreageResult]:
     results: Dict[int, CadAcreageResult] = {}
     driver: Optional[uc.Chrome] = None
-    pages_loaded = 0
+    browser_page_loads = 0
+    rows_processed_by_worker = 0
     consecutive_failures = 0
 
     def restart_driver() -> None:
@@ -1242,22 +1526,42 @@ def browser_worker(
         logging.info("[%s] [browser-%s] starting Chrome", county_name, worker_id)
         driver = create_driver()
 
+    def ensure_driver() -> uc.Chrome:
+        if driver is None:
+            restart_driver()
+        return driver  # type: ignore[return-value]
+
     try:
-        restart_driver()
+        if not USE_FAST_HTTP_FIRST:
+            ensure_driver()
+
         for idx, prop_id in items:
-            if pages_loaded > 0 and pages_loaded % RESTART_BROWSER_EVERY_N_PAGES == 0:
-                logging.info("[%s] [browser-%s] scheduled restart after %s pages", county_name, worker_id, pages_loaded)
+            if driver is not None and browser_page_loads > 0 and browser_page_loads % RESTART_BROWSER_EVERY_N_PAGES == 0:
+                logging.info("[%s] [browser-%s] scheduled Chrome restart after %s browser page loads", county_name, worker_id, browser_page_loads)
                 restart_driver()
 
             controller.before_request(worker_id)
-            result = load_and_parse_cad_legal_acreage(driver, base_url, prop_id)
-            pages_loaded += 1
+
+            if USE_FAST_HTTP_FIRST:
+                result = load_and_parse_cad_legal_acreage_fast_http(base_url, prop_id)
+                if result.status not in FAST_HTTP_ACCEPT_STATUSES and FALLBACK_TO_BROWSER_AFTER_HTTP_FAILURE:
+                    # The fast path returned a transient error, blocked page, or unrecognized page.
+                    # Try the real browser before marking the row as failed.
+                    driver_obj = ensure_driver()
+                    result = load_and_parse_cad_legal_acreage(driver_obj, base_url, prop_id)
+            else:
+                driver_obj = ensure_driver()
+                result = load_and_parse_cad_legal_acreage(driver_obj, base_url, prop_id)
+
+            rows_processed_by_worker += 1
+            if result.fetch_mode == "browser":
+                browser_page_loads += 1
             results[idx] = result
             controller.after_result(result, worker_id)
 
-            if result.status == "success":
+            if status_counts_as_request_ok(result.status):
                 consecutive_failures = 0
-            else:
+            elif status_should_throttle(result.status):
                 consecutive_failures += 1
 
             if progress_callback is not None:
@@ -1273,14 +1577,20 @@ def browser_worker(
                 consecutive_failures = 0
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES_PER_BROWSER:
-                logging.warning("[%s] [browser-%s] %s consecutive failures. Cooling down and restarting.", county_name, worker_id, consecutive_failures)
-                time.sleep(min(COOLDOWN_AFTER_BLOCK_SECONDS, 120.0))
-                restart_driver()
+                logging.warning(
+                    "[%s] [browser-%s] %s consecutive real failures. Short cooldown and restart.",
+                    county_name,
+                    worker_id,
+                    consecutive_failures,
+                )
+                time.sleep(min(COOLDOWN_AFTER_BLOCK_SECONDS, 45.0))
+                if driver is not None:
+                    restart_driver()
                 consecutive_failures = 0
 
-            if pages_loaded % LONG_PAUSE_EVERY_N_PAGES == 0:
+            if rows_processed_by_worker % LONG_PAUSE_EVERY_N_PAGES == 0:
                 pause = random.uniform(LONG_PAUSE_MIN_SECONDS, LONG_PAUSE_MAX_SECONDS)
-                logging.info("[%s] [browser-%s] long pause %.1fs after %s pages", county_name, worker_id, pause, pages_loaded)
+                logging.info("[%s] [browser-%s] long pause %.1fs after %s rows", county_name, worker_id, pause, rows_processed_by_worker)
                 time.sleep(pause)
 
     finally:
@@ -1335,27 +1645,33 @@ def run_probe_level(county_name: str, base_url: str, items: List[Tuple[int, str]
     elapsed = time.perf_counter() - start
     tested = len(all_results)
     success = sum(1 for r in all_results if r.status == "success")
+    request_ok = sum(1 for r in all_results if status_counts_as_request_ok(r.status))
     blocked = sum(1 for r in all_results if r.status == "blocked")
-    failed = tested - success
+    site_error = sum(1 for r in all_results if r.status == "site_error")
+    failed = tested - request_ok
     avg_seconds = mean([r.elapsed_seconds for r in all_results if r.elapsed_seconds]) if all_results else elapsed
     summary = {
         "worker_count": len(chunks),
         "tested": tested,
         "success": success,
+        "request_ok": request_ok,
         "failed": failed,
         "blocked": blocked,
+        "site_error": site_error,
         "failure_rate": (failed / tested) if tested else 1.0,
         "avg_seconds": round(avg_seconds, 3),
         "elapsed_seconds": round(elapsed, 3),
     }
     logging.info(
-        "[%s] Capacity probe result: workers=%s tested=%s success=%s failed=%s blocked=%s avg=%.2fs failure_rate=%.0f%%",
+        "[%s] Capacity probe result: workers=%s tested=%s request_ok=%s success=%s failed=%s blocked=%s site_error=%s avg=%.2fs failure_rate=%.0f%%",
         county_name,
         summary["worker_count"],
         tested,
+        request_ok,
         success,
         failed,
         blocked,
+        site_error,
         avg_seconds,
         summary["failure_rate"] * 100,
     )
@@ -1412,7 +1728,7 @@ def result_to_trace_values(result: CadAcreageResult, worker_id: int) -> Dict[str
 
     return {
         "cad_legal_acreage_status": clean_text(result.status),
-        "cad_legal_acreage_source": "cad_property_land_table" if result.status == "success" else "",
+        "cad_legal_acreage_source": f"cad_property_land_table_{clean_text(result.fetch_mode) or 'unknown'}" if result.status == "success" else "",
         "cad_legal_acreage_method": clean_text(result.method),
         "cad_legal_acreage_raw": clean_text(result.raw_acreage),
         "cad_legal_acreage_url": clean_text(result.url),
@@ -1422,6 +1738,8 @@ def result_to_trace_values(result: CadAcreageResult, worker_id: int) -> Dict[str
         "cad_legal_acreage_land_rows_json": land_rows_to_json(result.land_rows) if result.land_rows else "",
         "cad_legal_acreage_scraped_at": clean_text(result.scraped_at),
         "cad_legal_acreage_worker": worker if worker is not None else "",
+        "cad_legal_acreage_fetch_mode": clean_text(result.fetch_mode),
+        "cad_legal_acreage_parser_version": SCRIPT_VERSION,
     }
 
 
@@ -1433,10 +1751,28 @@ def row_needs_scrape(df: pd.DataFrame, idx: Any, prop_col: str, legal_col: str) 
         return False
 
     status = clean_text(df.at[idx, "cad_legal_acreage_status"]).lower() if "cad_legal_acreage_status" in df.columns else ""
+    parser_version = clean_text(df.at[idx, "cad_legal_acreage_parser_version"]) if "cad_legal_acreage_parser_version" in df.columns else ""
+
     if not status:
         return True
+
+    # If legal_acreage is still blank even though the row says success, retry;
+    # this protects against interrupted/failed live-save callbacks from older runs.
     if status == "success":
-        return False
+        return True
+
+    # Terminal no-fill statuses from this parser are trusted on resume. Older
+    # no_land_table statuses are retried because the previous version could
+    # misclassify a temporary CAD error page as no_land_table.
+    if status_is_terminal_no_fill(status):
+        if parser_version == SCRIPT_VERSION:
+            return RESCRAPE_CURRENT_TERMINAL_NO_FILL_ROWS
+        return RETRY_STALE_TERMINAL_NO_FILL_ROWS_ON_RESUME
+
+    # Failed/blocked/site_error rows are retryable by default.
+    if status_should_throttle(status):
+        return RESCRAPE_FAILED_ROWS
+
     return RESCRAPE_FAILED_ROWS
 
 
@@ -1536,16 +1872,21 @@ def process_file(
         "property_not_found": 0,
         "no_land_table": 0,
         "no_acreage_value": 0,
+        "site_error": 0,
+        "unprocessed": 0,
         "last_save_done": 0,
         "last_sheet_done": 0,
     }
     live_save_every = max(1, int(LIVE_SAVE_EVERY_N_ROWS))
     terminal_every = max(1, int(TERMINAL_PROGRESS_EVERY_N_ROWS))
     sheet_every = max(1, int(SHEET_UPDATE_EVERY_N_ROWS))
+    scrape_start_time = time.perf_counter()
+    processed_indices: set = set()
 
     def progress_callback(idx: Any, result: CadAcreageResult, worker_id: int) -> None:
         with progress_lock:
             filled = apply_result_to_dataframe(df, idx, legal_col, result, worker_id)
+            processed_indices.add(idx)
             processed_counter["done"] += 1
             if filled:
                 processed_counter["filled"] += 1
@@ -1559,6 +1900,8 @@ def process_file(
                 processed_counter["no_land_table"] += 1
             elif result.status == "no_acreage_value":
                 processed_counter["no_acreage_value"] += 1
+            elif result.status == "site_error":
+                processed_counter["site_error"] += 1
             else:
                 processed_counter["failed"] += 1
 
@@ -1572,6 +1915,7 @@ def process_file(
                     "acreage": result.acreage,
                     "raw_acreage": result.raw_acreage,
                     "method": result.method,
+                    "fetch_mode": result.fetch_mode,
                     "url": result.url,
                     "error": result.error,
                     "attempts": result.attempts,
@@ -1588,20 +1932,30 @@ def process_file(
                 processed_counter["last_save_done"] = done
 
             pct_done = (done / pending_total * 100.0) if pending_total else 100.0
+            elapsed_scrape = max(0.001, time.perf_counter() - scrape_start_time)
+            rows_per_minute = done / elapsed_scrape * 60.0
+            eta_seconds = ((pending_total - done) / (rows_per_minute / 60.0)) if rows_per_minute > 0 else None
+            controller_state = controller.snapshot()
             if done % terminal_every == 0 or done == pending_total:
                 logging.info(
-                    "[%s] %s | %s/%s missing rows (%.1f%%) | filled=%s failed=%s blocked=%s no_land=%s no_acres=%s | worker=%s | id=%s | status=%s | acres=%s | saved=%s",
+                    "[%s] %s | %s/%s rows (%.1f%%) | filled=%s no_land=%s no_acres=%s not_found=%s site_err=%s failed=%s blocked=%s | rate=%.1f rows/min ETA=%s delay=%.2fx | worker=%s fetch=%s id=%s status=%s acres=%s saved=%s",
                     county_name,
                     file_path.name,
                     done,
                     pending_total,
                     pct_done,
                     processed_counter["filled"],
-                    processed_counter["failed"],
-                    processed_counter["blocked"],
                     processed_counter["no_land_table"],
                     processed_counter["no_acreage_value"],
+                    processed_counter["property_not_found"],
+                    processed_counter["site_error"],
+                    processed_counter["failed"],
+                    processed_counter["blocked"],
+                    rows_per_minute,
+                    format_duration(eta_seconds),
+                    controller_state["delay_multiplier"],
                     worker_id,
+                    result.fetch_mode,
                     result.input_id,
                     result.status,
                     result.acreage if result.acreage is not None else "",
@@ -1612,7 +1966,7 @@ def process_file(
             if should_update_sheet:
                 website_lookup.update_status(
                     sheet_row,
-                    f"CAD acreage scraping {file_path.name}: {done}/{pending_total} | filled={processed_counter['filled']} | failed={processed_counter['failed']} | blocked={processed_counter['blocked']}",
+                    f"CAD acreage scraping {file_path.name}: {done}/{pending_total} | filled={processed_counter['filled']} | failed={processed_counter['failed']} | site_err={processed_counter['site_error']} | blocked={processed_counter['blocked']}",
                 )
                 processed_counter["last_sheet_done"] = done
 
@@ -1634,15 +1988,39 @@ def process_file(
                 except Exception as exc:
                     logging.exception("[%s] Browser worker %s crashed: %s", county_name, worker_id, exc)
 
+    remaining_items = [item for item in items if item[0] not in processed_indices]
+    if remaining_items and RETRY_UNPROCESSED_ROWS_AFTER_WORKER_CRASH:
+        logging.warning(
+            "[%s] %s row(s) did not reach the progress callback. Retrying once with one recovery worker before finalizing.",
+            county_name,
+            len(remaining_items),
+        )
+        try:
+            browser_worker(county_name, 999, base_url, remaining_items, controller, progress_callback=progress_callback)
+        except Exception as exc:
+            logging.exception("[%s] Recovery worker crashed: %s", county_name, exc)
+
+    remaining_items = [item for item in items if item[0] not in processed_indices]
+    processed_counter["unprocessed"] = len(remaining_items)
+    if remaining_items:
+        logging.warning(
+            "[%s] File is incomplete: %s/%s targeted rows processed; %s rows still unprocessed.",
+            county_name,
+            processed_counter["done"],
+            pending_total,
+            len(remaining_items),
+        )
+
     write_output_file(df, out_path)
     missing_after = int(sum(1 for idx in df.index if legal_acreage_is_missing(df.at[idx, legal_col])))
     elapsed = round(time.perf_counter() - start_time, 3)
+    file_status = "partial_incomplete" if processed_counter["unprocessed"] else "ok"
 
     summary = FileSummary(
         county=county_name,
         input_file=str(file_path),
         output_file=str(out_path),
-        status="ok",
+        status=file_status,
         total_rows=total_rows,
         missing_before=missing_before,
         targeted_rows=pending_total,
@@ -1654,12 +2032,14 @@ def process_file(
         property_not_found=processed_counter["property_not_found"],
         no_land_table=processed_counter["no_land_table"],
         no_acreage_value=processed_counter["no_acreage_value"],
+        site_error=processed_counter["site_error"],
+        unprocessed=processed_counter["unprocessed"],
         missing_after=missing_after,
         worker_count=len(chunks),
         elapsed_seconds=elapsed,
     )
-    logging.info("[%s] Final file saved: %s | filled=%s | missing_after=%s | elapsed=%.1fs", county_name, out_path, summary.filled_from_cad, missing_after, elapsed)
-    website_lookup.update_status(sheet_row, f"CAD acreage complete {file_path.name}: filled={summary.filled_from_cad}/{pending_total} | missing_after={missing_after}")
+    logging.info("[%s] Final file saved: %s | status=%s | filled=%s | missing_after=%s | unprocessed=%s | elapsed=%.1fs", county_name, out_path, summary.status, summary.filled_from_cad, missing_after, summary.unprocessed, elapsed)
+    website_lookup.update_status(sheet_row, f"CAD acreage {summary.status} {file_path.name}: filled={summary.filled_from_cad}/{pending_total} | site_err={summary.site_error} | unprocessed={summary.unprocessed} | missing_after={missing_after}")
     return summary
 
 
@@ -1750,6 +2130,8 @@ def file_summary_to_dict(summary: FileSummary) -> Dict[str, Any]:
         "property_not_found": summary.property_not_found,
         "no_land_table": summary.no_land_table,
         "no_acreage_value": summary.no_acreage_value,
+        "site_error": summary.site_error,
+        "unprocessed": summary.unprocessed,
         "missing_legal_acreage_after": summary.missing_after,
         "worker_count_used": summary.worker_count,
         "elapsed_seconds": summary.elapsed_seconds,
@@ -1794,8 +2176,10 @@ def write_html_report(
     ok_files = sum(1 for s in summaries if s.status in {"ok", "no_pending_rows"})
     total_targeted = sum(s.targeted_rows for s in summaries)
     total_filled = sum(s.filled_from_cad for s in summaries)
-    total_missing_after = sum(s.missing_after for s in summaries if s.status in {"ok", "no_pending_rows"})
+    total_missing_after = sum(s.missing_after for s in summaries if s.status in {"ok", "no_pending_rows", "partial_incomplete"})
     total_blocked = sum(s.blocked for s in summaries)
+    total_site_error = sum(s.site_error for s in summaries)
+    total_unprocessed = sum(s.unprocessed for s in summaries)
     total_failed = sum(s.failed for s in summaries)
 
     rows_html = []
@@ -1812,7 +2196,9 @@ def write_html_report(
             f"<td class='num'>{s.missing_after:,}</td>"
             f"<td class='num'>{s.worker_count}</td>"
             f"<td class='num'>{s.blocked:,}</td>"
+            f"<td class='num'>{s.site_error:,}</td>"
             f"<td class='num'>{s.failed:,}</td>"
+            f"<td class='num'>{s.unprocessed:,}</td>"
             f"<td>{html_escape(s.error)}</td>"
             "</tr>"
         )
@@ -1854,6 +2240,8 @@ The value comes from the CAD property page's <strong>Property Land &rarr; Acreag
   <div class="card"><div class="label">Filled from CAD</div><div class="value ok">{total_filled:,}</div></div>
   <div class="card"><div class="label">Missing after</div><div class="value warn">{total_missing_after:,}</div></div>
   <div class="card"><div class="label">Blocked rows</div><div class="value warn">{total_blocked:,}</div></div>
+  <div class="card"><div class="label">Site error rows</div><div class="value warn">{total_site_error:,}</div></div>
+  <div class="card"><div class="label">Unprocessed rows</div><div class="value warn">{total_unprocessed:,}</div></div>
   <div class="card"><div class="label">Failed rows</div><div class="value warn">{total_failed:,}</div></div>
 </div>
 
@@ -1868,7 +2256,7 @@ The value comes from the CAD property page's <strong>Property Land &rarr; Acreag
 <table>
 <thead>
 <tr>
-<th>County</th><th>Status</th><th>File</th><th class="num">Total Rows</th><th class="num">Missing Before</th><th class="num">Targeted</th><th class="num">Filled</th><th class="num">Missing After</th><th class="num">Workers</th><th class="num">Blocked</th><th class="num">Failed</th><th>Error</th>
+<th>County</th><th>Status</th><th>File</th><th class="num">Total Rows</th><th class="num">Missing Before</th><th class="num">Targeted</th><th class="num">Filled</th><th class="num">Missing After</th><th class="num">Workers</th><th class="num">Blocked</th><th class="num">Site Errors</th><th class="num">Failed</th><th class="num">Unprocessed</th><th>Error</th>
 </tr>
 </thead>
 <tbody>
@@ -1893,6 +2281,7 @@ def main() -> int:
     logging.info("INPUT_ROOT=%s", INPUT_ROOT)
     logging.info("OUTPUT_ROOT=%s | IN_PLACE_UPDATE=%s", OUTPUT_ROOT, IN_PLACE_UPDATE)
     logging.info("HEADLESS=%s | MAX_COUNTY_WORKERS=%s | MAX_BROWSER_WORKERS_PER_COUNTY=%s", HEADLESS, MAX_COUNTY_WORKERS, MAX_BROWSER_WORKERS_PER_COUNTY)
+    logging.info("FAST_HTTP_FIRST=%s | FALLBACK_TO_BROWSER=%s | delay=%.2f-%.2fs | adaptive_max=%.2fx", USE_FAST_HTTP_FIRST, FALLBACK_TO_BROWSER_AFTER_HTTP_FAILURE, MIN_DELAY_SECONDS, MAX_DELAY_SECONDS, ADAPTIVE_MAX_DELAY_MULTIPLIER)
 
     maybe_cleanup_uc_cache()
 
@@ -1951,7 +2340,7 @@ def main() -> int:
 
     total_targeted = sum(s.targeted_rows for s in all_summaries)
     total_filled = sum(s.filled_from_cad for s in all_summaries)
-    total_missing_after = sum(s.missing_after for s in all_summaries if s.status in {"ok", "no_pending_rows"})
+    total_missing_after = sum(s.missing_after for s in all_summaries if s.status in {"ok", "no_pending_rows", "partial_incomplete"})
 
     logging.info("Finished CAD legal acreage scraper.")
     logging.info("Rows targeted: %s | filled from CAD: %s | missing after: %s", total_targeted, total_filled, total_missing_after)
